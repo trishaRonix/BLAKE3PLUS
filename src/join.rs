@@ -20,6 +20,8 @@
 ///
 /// See the [`join` module docs](index.html) for more details.
 pub trait Join {
+    const MIN_PARALLEL_BYTES: usize = 0;
+
     fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
     where
         A: FnOnce() -> RA + Send,
@@ -59,6 +61,8 @@ pub enum RayonJoin {}
 
 #[cfg(feature = "rayon")]
 impl Join for RayonJoin {
+    const MIN_PARALLEL_BYTES: usize = 16 * 1024;
+
     #[inline]
     fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
     where

@@ -100,6 +100,9 @@ pub mod hazmat;
 #[doc(hidden)]
 pub mod platform;
 
+#[cfg(feature = "std")]
+pub mod blake3plus;
+
 // Platform-specific implementations of the compression function. These
 // BLAKE3-specific cfg flags are set in build.rs.
 #[cfg(blake3_avx2_rust)]
@@ -858,10 +861,40 @@ fn compress_subtree_wide<J: join::Join>(
 
     // Recurse! For update_rayon(), this is where we take advantage of RayonJoin and use multiple
     // threads.
-    let (left_n, right_n) = J::join(
-        || compress_subtree_wide::<J>(left, key, chunk_counter, flags, platform, left_out),
-        || compress_subtree_wide::<J>(right, key, right_chunk_counter, flags, platform, right_out),
-    );
+    let (left_n, right_n) = if J::MIN_PARALLEL_BYTES > 0 && right.len() < J::MIN_PARALLEL_BYTES {
+        (
+            compress_subtree_wide::<join::SerialJoin>(
+                left,
+                key,
+                chunk_counter,
+                flags,
+                platform,
+                left_out,
+            ),
+            compress_subtree_wide::<join::SerialJoin>(
+                right,
+                key,
+                right_chunk_counter,
+                flags,
+                platform,
+                right_out,
+            ),
+        )
+    } else {
+        J::join(
+            || compress_subtree_wide::<J>(left, key, chunk_counter, flags, platform, left_out),
+            || {
+                compress_subtree_wide::<J>(
+                    right,
+                    key,
+                    right_chunk_counter,
+                    flags,
+                    platform,
+                    right_out,
+                )
+            },
+        )
+    };
 
     // The special case again. If simd_degree=1, then we'll have left_n=1 and
     // right_n=1. Rather than compressing them into a single output, return
@@ -1542,7 +1575,12 @@ impl Hasher {
     /// the `rayon` and `mmap` Cargo features.
     #[cfg(feature = "rayon")]
     pub fn update_rayon(&mut self, input: &[u8]) -> &mut Self {
-        self.update_with_join::<join::RayonJoin>(input)
+        use crate::join::Join;
+        if input.len() <= join::RayonJoin::MIN_PARALLEL_BYTES {
+            self.update_with_join::<join::SerialJoin>(input)
+        } else {
+            self.update_with_join::<join::RayonJoin>(input)
+        }
     }
 
     /// As [`update`](Hasher::update), but reading the contents of a file using memory mapping.
@@ -1647,9 +1685,36 @@ impl Hasher {
         if let Some(mmap) = io::maybe_mmap_file(&mut file)? {
             self.update_rayon(&mmap);
         } else {
-            io::copy_wide(&file, self)?;
+            blake3plus::update_hasher_reader_mt(self, &mut file)?;
         }
         Ok(self)
+    }
+
+    /// Zeroizes internal key material, chaining value stack, and chunk buffer.
+    pub fn secure_wipe(&mut self) {
+        for word in &mut self.key {
+            unsafe { core::ptr::write_volatile(word, 0) };
+        }
+        for word in &mut self.chunk_state.cv {
+            unsafe { core::ptr::write_volatile(word, 0) };
+        }
+        unsafe { core::ptr::write_volatile(&mut self.chunk_state.chunk_counter, 0) };
+        for byte in &mut self.chunk_state.buf.0 {
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        unsafe {
+            core::ptr::write_volatile(&mut self.chunk_state.buf_len, 0);
+            core::ptr::write_volatile(&mut self.chunk_state.blocks_compressed, 0);
+            core::ptr::write_volatile(&mut self.chunk_state.flags, 0);
+            core::ptr::write_volatile(&mut self.initial_chunk_counter, 0);
+        }
+        for cv in self.cv_stack.as_mut_slice() {
+            for byte in cv {
+                unsafe { core::ptr::write_volatile(byte, 0) };
+            }
+        }
+        self.cv_stack.clear();
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1667,6 +1732,13 @@ impl Default for Hasher {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Hasher {
+    #[inline]
+    fn drop(&mut self) {
+        self.secure_wipe();
     }
 }
 

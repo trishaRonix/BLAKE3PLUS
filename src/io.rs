@@ -94,6 +94,8 @@ pub(crate) fn maybe_mmap_file(file: &mut File) -> io::Result<Option<memmap2::Mma
         let mut mmap_options = memmap2::MmapOptions::new();
         mmap_options.len((offset_len + seek_offset) as usize); // checked above
         if let Ok(mmap) = unsafe { mmap_options.map(&*file) } {
+            #[cfg(unix)]
+            let _ = mmap.advise(memmap2::Advice::Sequential);
             return Ok(Some(mmap));
         }
     }
