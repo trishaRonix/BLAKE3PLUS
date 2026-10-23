@@ -1,4 +1,8 @@
 blake3
+b3p
+test_mt
+bench_*
+blake3_example
 example
 example_tbb
 build/
