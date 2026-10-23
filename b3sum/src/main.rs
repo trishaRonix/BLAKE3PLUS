@@ -11,7 +11,6 @@ mod unit_tests;
 
 const NAME: &str = "b3sum";
 
-const DERIVE_KEY_ARG: &str = "derive_key";
 const KEYED_ARG: &str = "keyed";
 const LENGTH_ARG: &str = "length";
 const NO_NAMES_ARG: &str = "no_names";
@@ -58,8 +57,6 @@ struct Inner {
     num_threads: Option<usize>,
 
     /// Disable memory mapping
-    ///
-    /// Currently this also disables multithreading.
     #[arg(long)]
     no_mmap: bool,
 
@@ -81,8 +78,6 @@ struct Inner {
     #[arg(
         short,
         long,
-        conflicts_with(DERIVE_KEY_ARG),
-        conflicts_with(KEYED_ARG),
         conflicts_with(LENGTH_ARG),
         conflicts_with(RAW_ARG),
         conflicts_with(TAG_ARG),
@@ -119,7 +114,10 @@ impl Args {
         let base_hasher = if inner.keyed {
             // In keyed mode, since stdin is used for the key, we can't handle
             // `-` arguments. Input::open handles that case below.
-            blake3::Hasher::new_keyed(&read_key_from_stdin()?)
+            let mut key = read_key_from_stdin()?;
+            let hasher = blake3::Hasher::new_keyed(&key);
+            blake3::blake3plus::secure_zero_slice(&mut key);
+            hasher
         } else if let Some(ref context) = inner.derive_key {
             blake3::Hasher::new_derive_key(context)
         } else {
@@ -179,9 +177,9 @@ fn hash_path(args: &Args, path: &Path) -> anyhow::Result<blake3::OutputReader> {
         if args.keyed() {
             bail!("Cannot open `-` in keyed mode");
         }
-        hasher.update_reader(io::stdin().lock())?;
+        blake3::blake3plus::update_hasher_reader_mt(&mut hasher, io::stdin().lock())?;
     } else if args.no_mmap() {
-        hasher.update_reader(File::open(path)?)?;
+        blake3::blake3plus::update_hasher_reader_mt(&mut hasher, File::open(path)?)?;
     } else {
         // The fast path: Try to mmap the file and hash it with multiple threads.
         hasher.update_mmap_rayon(path)?;
@@ -223,15 +221,20 @@ fn read_key_from_stdin() -> anyhow::Result<[u8; blake3::KEY_LEN]> {
         .take(blake3::KEY_LEN as u64 + 1)
         .read_to_end(&mut bytes)?;
     if n < blake3::KEY_LEN {
+        blake3::blake3plus::secure_zero_slice(&mut bytes);
         bail!(
             "expected {} key bytes from stdin, found {}",
             blake3::KEY_LEN,
             n,
         )
     } else if n > blake3::KEY_LEN {
+        blake3::blake3plus::secure_zero_slice(&mut bytes);
         bail!("read more than {} key bytes from stdin", blake3::KEY_LEN)
     } else {
-        Ok(bytes[..blake3::KEY_LEN].try_into().unwrap())
+        let mut out = [0u8; blake3::KEY_LEN];
+        out.copy_from_slice(&bytes[..blake3::KEY_LEN]);
+        blake3::blake3plus::secure_zero_slice(&mut bytes);
+        Ok(out)
     }
 }
 
@@ -518,12 +521,8 @@ fn check_one_checkfile(path: &Path, args: &Args, files_failed: &mut u64) -> anyh
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
-    let mut thread_pool_builder = rayon_core::ThreadPoolBuilder::new();
-    if let Some(num_threads) = args.num_threads() {
-        thread_pool_builder = thread_pool_builder.num_threads(num_threads);
-    }
-    let thread_pool = thread_pool_builder.build()?;
-    thread_pool.install(|| {
+    let thread_pool = blake3::blake3plus::build_optimal_thread_pool(args.num_threads())?;
+    let files_failed = thread_pool.install(|| -> anyhow::Result<u64> {
         let mut files_failed = 0u64;
         // Note that file_args automatically includes `-` if nothing is given.
         for path in &args.file_args {
@@ -549,8 +548,13 @@ fn main() -> anyhow::Result<()> {
                 if files_failed == 1 { "" } else { "s" },
             );
         }
-        std::process::exit(if files_failed > 0 { 1 } else { 0 });
-    })
+        Ok(files_failed)
+    })?;
+    drop(args);
+    if files_failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

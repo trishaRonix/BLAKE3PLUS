@@ -690,3 +690,37 @@ fn test_globbing() {
         .unwrap();
     assert_eq!(expected, output);
 }
+
+#[test]
+fn test_keyed_check() {
+    let key = [0x42u8; blake3::KEY_LEN];
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a"), b"hello").unwrap();
+    fs::write(dir.path().join("b"), b"world").unwrap();
+
+    let checkfile = cmd!(b3sum_exe(), "--keyed", "a", "b")
+        .dir(dir.path())
+        .stdin_bytes(&key[..])
+        .read()
+        .unwrap();
+    let checkfile_path = dir.path().join("sums.txt");
+    fs::write(&checkfile_path, format!("{}\n", checkfile)).unwrap();
+
+    let out = cmd!(b3sum_exe(), "--keyed", "--check", &checkfile_path)
+        .dir(dir.path())
+        .stdin_bytes(&key[..])
+        .read()
+        .unwrap();
+    assert_eq!(out, "a: OK\nb: OK");
+
+    let wrong_key = [0x43u8; blake3::KEY_LEN];
+    let bad = cmd!(b3sum_exe(), "--keyed", "--check", &checkfile_path)
+        .dir(dir.path())
+        .stdin_bytes(&wrong_key[..])
+        .stdout_capture()
+        .stderr_capture()
+        .unchecked()
+        .run()
+        .unwrap();
+    assert!(!bad.status.success());
+}
