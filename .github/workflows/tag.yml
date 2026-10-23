@@ -9,6 +9,9 @@ env:
   BLAKE3_CI: "1"
   RUSTFLAGS: "-D warnings"
 
+permissions:
+  contents: write
+
 jobs:
   cargo_tests:
     name: ${{ matrix.target.name }}

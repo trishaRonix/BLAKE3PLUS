@@ -502,3 +502,11 @@ jobs:
     - name: cargo test C bindings with TBB
       run: cargo test --features=tbb
       working-directory: ./c/blake3_c_rust_bindings
+
+  c11_pthread_tests:
+    name: C11 pthread tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make test
