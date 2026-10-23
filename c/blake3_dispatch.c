@@ -4,6 +4,20 @@
 
 #include "blake3_impl.h"
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define BLAKE3_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
+#endif
+#endif
+#if !defined(BLAKE3_MSAN_UNPOISON) && defined(__MEMORY_SANITIZER__)
+#include <sanitizer/msan_interface.h>
+#define BLAKE3_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
+#endif
+#ifndef BLAKE3_MSAN_UNPOISON
+#define BLAKE3_MSAN_UNPOISON(ptr, size) ((void)0)
+#endif
+
 #if defined(_MSC_VER)
 #include <Windows.h>
 #endif
@@ -175,18 +189,21 @@ void blake3_compress_in_place(uint32_t cv[8],
 #if !defined(BLAKE3_NO_AVX512)
   if (features & AVX512VL) {
     blake3_compress_in_place_avx512(cv, block, block_len, counter, flags);
+    BLAKE3_MSAN_UNPOISON(cv, 32);
     return;
   }
 #endif
 #if !defined(BLAKE3_NO_SSE41)
   if (features & SSE41) {
     blake3_compress_in_place_sse41(cv, block, block_len, counter, flags);
+    BLAKE3_MSAN_UNPOISON(cv, 32);
     return;
   }
 #endif
 #if !defined(BLAKE3_NO_SSE2)
   if (features & SSE2) {
     blake3_compress_in_place_sse2(cv, block, block_len, counter, flags);
+    BLAKE3_MSAN_UNPOISON(cv, 32);
     return;
   }
 #endif
@@ -204,18 +221,21 @@ void blake3_compress_xof(const uint32_t cv[8],
 #if !defined(BLAKE3_NO_AVX512)
   if (features & AVX512VL) {
     blake3_compress_xof_avx512(cv, block, block_len, counter, flags, out);
+    BLAKE3_MSAN_UNPOISON(out, 64);
     return;
   }
 #endif
 #if !defined(BLAKE3_NO_SSE41)
   if (features & SSE41) {
     blake3_compress_xof_sse41(cv, block, block_len, counter, flags, out);
+    BLAKE3_MSAN_UNPOISON(out, 64);
     return;
   }
 #endif
 #if !defined(BLAKE3_NO_SSE2)
   if (features & SSE2) {
     blake3_compress_xof_sse2(cv, block, block_len, counter, flags, out);
+    BLAKE3_MSAN_UNPOISON(out, 64);
     return;
   }
 #endif
@@ -238,6 +258,7 @@ void blake3_xof_many(const uint32_t cv[8],
 #if !defined(_WIN32) && !defined(__CYGWIN__) && !defined(BLAKE3_NO_AVX512)
   if (features & AVX512VL) {
     blake3_xof_many_avx512(cv, block, block_len, counter, flags, out, outblocks);
+    BLAKE3_MSAN_UNPOISON(out, outblocks * 64);
     return;
   }
 #endif
@@ -259,6 +280,7 @@ void blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
     blake3_hash_many_avx512(inputs, num_inputs, blocks, key, counter,
                             increment_counter, flags, flags_start, flags_end,
                             out);
+    BLAKE3_MSAN_UNPOISON(out, num_inputs * 32);
     return;
   }
 #endif
@@ -267,6 +289,7 @@ void blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
     blake3_hash_many_avx2(inputs, num_inputs, blocks, key, counter,
                           increment_counter, flags, flags_start, flags_end,
                           out);
+    BLAKE3_MSAN_UNPOISON(out, num_inputs * 32);
     return;
   }
 #endif
@@ -275,6 +298,7 @@ void blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
     blake3_hash_many_sse41(inputs, num_inputs, blocks, key, counter,
                            increment_counter, flags, flags_start, flags_end,
                            out);
+    BLAKE3_MSAN_UNPOISON(out, num_inputs * 32);
     return;
   }
 #endif
@@ -283,6 +307,7 @@ void blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
     blake3_hash_many_sse2(inputs, num_inputs, blocks, key, counter,
                           increment_counter, flags, flags_start, flags_end,
                           out);
+    BLAKE3_MSAN_UNPOISON(out, num_inputs * 32);
     return;
   }
 #endif

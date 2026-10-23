@@ -314,6 +314,13 @@ size_t blake3_compress_subtree_wide(const uint8_t *input, size_t input_len,
       input, left_input_len, chunk_counter, cv_array, &left_n,
       // right-hand side
       right_input, right_input_len, right_chunk_counter, right_cvs, &right_n);
+#elif defined(BLAKE3PLUS_ENABLE_PTHREAD)
+  blake3plus_compress_subtree_wide_join_pthread(
+      key, flags, use_tbb,
+      // left-hand side
+      input, left_input_len, chunk_counter, cv_array, &left_n,
+      // right-hand side
+      right_input, right_input_len, right_chunk_counter, right_cvs, &right_n);
 #else
   left_n = blake3_compress_subtree_wide(
       input, left_input_len, key, chunk_counter, flags, cv_array, use_tbb);
@@ -595,6 +602,13 @@ void blake3_hasher_update_tbb(blake3_hasher *self, const void *input,
   blake3_hasher_update_base(self, input, input_len, use_tbb);
 }
 #endif // BLAKE3_USE_TBB
+
+#if defined(BLAKE3PLUS_ENABLE_PTHREAD)
+void blake3_hasher_update_mt_internal(blake3_hasher *self, const void *input,
+                                      size_t input_len) {
+  blake3_hasher_update_base(self, input, input_len, true);
+}
+#endif // BLAKE3PLUS_ENABLE_PTHREAD
 
 void blake3_hasher_finalize(const blake3_hasher *self, uint8_t *out,
                             size_t out_len) {
