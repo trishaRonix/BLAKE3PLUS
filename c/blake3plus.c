@@ -274,8 +274,13 @@ static void b3p_execute_slot(size_t slot_idx) {
   pthread_mutex_unlock(&slot->mtx);
 }
 
+static sigjmp_buf g_sigbus_envs[B3P_MAX_WORKERS + 1];
+static volatile sig_atomic_t g_sigbus_enabled[B3P_MAX_WORKERS + 1] = {0};
+static _Thread_local int tl_worker_id = -1;
+
 static void *b3p_worker_loop(void *arg) {
-  (void)arg;
+  int worker_id = (int)(intptr_t)arg;
+  tl_worker_id = worker_id;
   while (1) {
     pthread_mutex_lock(&g_ring.lock);
     while (g_ring.count == 0 && !g_ring.shutdown) {
@@ -290,7 +295,14 @@ static void *b3p_worker_loop(void *arg) {
     g_ring.count--;
     pthread_mutex_unlock(&g_ring.lock);
 
+    g_sigbus_enabled[worker_id] = 1;
+    if (sigsetjmp(g_sigbus_envs[worker_id], 1) != 0) {
+      g_sigbus_enabled[worker_id] = 0;
+      atomic_store_explicit(&g_slots[slot_idx].state, B3P_TASK_DONE, memory_order_release);
+      continue;
+    }
     b3p_execute_slot(slot_idx);
+    g_sigbus_enabled[worker_id] = 0;
   }
   return NULL;
 }
@@ -385,7 +397,7 @@ static void b3p_ensure_pool_scaled(size_t desired_threads) {
   (void)pthread_attr_setstacksize(&attr, BLAKE3PLUS_WORKER_STACK_SIZE);
 
   for (size_t i = current; i < target_workers; i++) {
-    if (pthread_create(&g_worker_threads[i], &attr, b3p_worker_loop, NULL) != 0) {
+    if (pthread_create(&g_worker_threads[i], &attr, b3p_worker_loop, (void *)(intptr_t)i) != 0) {
       target_workers = i;
       break;
     }
@@ -514,28 +526,22 @@ BLAKE3_API void blake3plus_hash_buffer_mt(const void *input,
 }
 
 /* SIGBUS handler to protect against concurrent file truncation during mmap */
-static atomic_bool g_sigbus_active = false;
-static _Thread_local sigjmp_buf tl_sigbus_env;
-static _Thread_local volatile sig_atomic_t tl_sigbus_enabled = 0;
 static struct sigaction b3p_old_sigbus_sa;
 static pthread_once_t b3p_sigbus_once = PTHREAD_ONCE_INIT;
 
 static void b3p_sigbus_handler(int sig, siginfo_t *info, void *ctx) {
   (void)sig; (void)info; (void)ctx;
-  if (atomic_load_explicit(&g_sigbus_active, memory_order_acquire)) {
-    if (tl_sigbus_enabled) {
-      siglongjmp(tl_sigbus_env, 1);
-    }
-    pthread_exit(NULL);
+  int id = tl_worker_id;
+  if (id >= 0 && id <= (int)B3P_MAX_WORKERS && g_sigbus_enabled[id]) {
+    siglongjmp(g_sigbus_envs[id], 1);
   }
-  if (b3p_old_sigbus_sa.sa_handler != SIG_DFL &&
-      b3p_old_sigbus_sa.sa_handler != SIG_IGN &&
-      b3p_old_sigbus_sa.sa_sigaction != NULL) {
-    if (b3p_old_sigbus_sa.sa_flags & SA_SIGINFO) {
-      b3p_old_sigbus_sa.sa_sigaction(sig, info, ctx);
-    } else {
-      b3p_old_sigbus_sa.sa_handler(sig);
-    }
+  if (b3p_old_sigbus_sa.sa_sigaction != NULL &&
+      (b3p_old_sigbus_sa.sa_flags & SA_SIGINFO)) {
+    b3p_old_sigbus_sa.sa_sigaction(sig, info, ctx);
+  } else if (b3p_old_sigbus_sa.sa_handler != NULL &&
+             b3p_old_sigbus_sa.sa_handler != SIG_DFL &&
+             b3p_old_sigbus_sa.sa_handler != SIG_IGN) {
+    b3p_old_sigbus_sa.sa_handler(sig);
   } else {
     signal(SIGBUS, SIG_DFL);
     raise(SIGBUS);
@@ -595,16 +601,14 @@ static void *b3p_stream_reader_worker(void *arg) {
 
 static int __attribute__((noinline)) b3p_safe_mmap_update(
     blake3_hasher *hasher, void *mapped, size_t map_len, size_t num_threads) {
-  atomic_store_explicit(&g_sigbus_active, true, memory_order_release);
-  tl_sigbus_enabled = 1;
-  if (sigsetjmp(tl_sigbus_env, 1) != 0) {
-    tl_sigbus_enabled = 0;
-    atomic_store_explicit(&g_sigbus_active, false, memory_order_release);
+  tl_worker_id = (int)B3P_MAX_WORKERS;
+  g_sigbus_enabled[B3P_MAX_WORKERS] = 1;
+  if (sigsetjmp(g_sigbus_envs[B3P_MAX_WORKERS], 1) != 0) {
+    g_sigbus_enabled[B3P_MAX_WORKERS] = 0;
     return -1;
   }
   blake3plus_hasher_update_mt(hasher, mapped, map_len, num_threads);
-  tl_sigbus_enabled = 0;
-  atomic_store_explicit(&g_sigbus_active, false, memory_order_release);
+  g_sigbus_enabled[B3P_MAX_WORKERS] = 0;
   return 0;
 }
 
