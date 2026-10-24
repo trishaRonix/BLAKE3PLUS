@@ -375,20 +375,25 @@ static void run_bench(void) {
   size_t hw = blake3plus_get_effective_cpus();
   blake3plus_hash_buffer_mt(buf, len, out, sizeof(out), hw);
 
-  double t0 = now_sec();
-  for (int i = 0; i < iters; i++) {
-    blake3plus_hash_buffer_mt(buf, len, out, sizeof(out), 1);
+  size_t thread_counts[] = {1, 2, 4, 6, 8, 12};
+  double dt_1t = 0.0;
+  for (size_t idx = 0; idx < sizeof(thread_counts) / sizeof(thread_counts[0]); idx++) {
+    size_t t = thread_counts[idx];
+    if (t > hw && idx > 0) {
+      continue;
+    }
+    blake3plus_hash_buffer_mt(buf, len, out, sizeof(out), t);
+    double t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+      blake3plus_hash_buffer_mt(buf, len, out, sizeof(out), t);
+    }
+    double dt = now_sec() - t0;
+    if (t == 1) {
+      dt_1t = dt;
+    }
+    printf("c11 1 GiB (64 MiB x 16) %2zuT: %6.2f GB/s (%5.2fx)\n",
+           t, 1.073741824 / dt, dt_1t / dt);
   }
-  double dt_st = now_sec() - t0;
-
-  t0 = now_sec();
-  for (int i = 0; i < iters; i++) {
-    blake3plus_hash_buffer_mt(buf, len, out, sizeof(out), hw);
-  }
-  double dt_mt = now_sec() - t0;
-
-  printf("c11 1 GiB (64 MiB x 16): 1T=%.2f GB/s, %zuT=%.2f GB/s (%.2fx)\n",
-         1.0 / dt_st, hw, 1.0 / dt_mt, dt_st / dt_mt);
   free(buf);
   blake3plus_pool_teardown();
 }
