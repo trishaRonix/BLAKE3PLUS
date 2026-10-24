@@ -112,6 +112,66 @@ pub fn build_optimal_thread_pool(
         .build()
 }
 
+#[cfg(not(target_family = "wasm"))]
+pub fn update_hasher_reader_mt(hasher: &mut Hasher, mut reader: impl Read + Send) -> io::Result<u64> {
+    const CHUNK_SIZE: usize = STREAM_BUFFER_BYTES;
+    let (tx_full, rx_full) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+    let (tx_empty, rx_empty) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+
+    let _ = tx_empty.send(vec![0u8; CHUNK_SIZE]);
+    let _ = tx_empty.send(vec![0u8; CHUNK_SIZE]);
+
+    let mut total = 0u64;
+
+    std::thread::scope(|s| {
+        let reader_handle = s.spawn(move || -> io::Result<()> {
+            while let Ok(mut buf) = rx_empty.recv() {
+                let mut filled = 0;
+                while filled < CHUNK_SIZE {
+                    match reader.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            let _ = tx_full.send(Vec::new());
+                            return Err(e);
+                        }
+                    }
+                }
+                buf.truncate(filled);
+                let is_eof = filled == 0;
+                let _ = tx_full.send(buf);
+                if is_eof {
+                    break;
+                }
+            }
+            Ok(())
+        });
+
+        while let Ok(mut buf) = rx_full.recv() {
+            if buf.is_empty() {
+                break;
+            }
+            #[cfg(feature = "rayon")]
+            hasher.update_rayon(&buf);
+            #[cfg(not(feature = "rayon"))]
+            hasher.update(&buf);
+            total += buf.len() as u64;
+
+            secure_zero_slice(&mut buf);
+            buf.resize(CHUNK_SIZE, 0);
+            let _ = tx_empty.send(buf);
+        }
+
+        match reader_handle.join() {
+            Ok(Ok(())) => Ok(total),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::Other, "reader thread panicked")),
+        }
+    })
+}
+
+#[cfg(target_family = "wasm")]
 pub fn update_hasher_reader_mt(hasher: &mut Hasher, mut reader: impl Read) -> io::Result<u64> {
     let mut buf = vec![0u8; STREAM_BUFFER_BYTES];
     let mut total = 0u64;
@@ -122,9 +182,6 @@ pub fn update_hasher_reader_mt(hasher: &mut Hasher, mut reader: impl Read) -> io
             match reader.read(&mut buf[filled..]) {
                 Ok(0) => {
                     if filled > 0 {
-                        #[cfg(feature = "rayon")]
-                        hasher.update_rayon(&buf[..filled]);
-                        #[cfg(not(feature = "rayon"))]
                         hasher.update(&buf[..filled]);
                         total += filled as u64;
                     }
@@ -133,9 +190,6 @@ pub fn update_hasher_reader_mt(hasher: &mut Hasher, mut reader: impl Read) -> io
                 Ok(n) => {
                     filled += n;
                     if filled == buf.len() {
-                        #[cfg(feature = "rayon")]
-                        hasher.update_rayon(&buf);
-                        #[cfg(not(feature = "rayon"))]
                         hasher.update(&buf);
                         total += filled as u64;
                         filled = 0;

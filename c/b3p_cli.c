@@ -1,11 +1,13 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "blake3plus.h"
 
@@ -114,8 +116,8 @@ int main(int argc, char **argv) {
         continue;
       }
     } else {
-      FILE *fp = (strcmp(path, "/dev/stdin") == 0) ? stdin : fopen(path, "rb");
-      if (!fp) {
+      int fd = (strcmp(path, "/dev/stdin") == 0) ? 0 : open(path, O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
         fprintf(stderr, "b3p: %s: %s\n", path, strerror(errno));
         exit_code = 1;
         continue;
@@ -126,38 +128,19 @@ int main(int argc, char **argv) {
       } else {
         blake3_hasher_init_derive_key(&hasher, derive_ctx);
       }
-      size_t buf_sz = 4 * 1024 * 1024;
-      uint8_t *buf = (uint8_t *)malloc(buf_sz);
-      if (!buf) {
-        fprintf(stderr, "b3p: malloc failed\n");
+      if (blake3plus_hasher_hash_fd(&hasher, fd, threads) != 0) {
+        fprintf(stderr, "b3p: %s: %s\n", path, strerror(errno));
         blake3plus_hasher_secure_wipe(&hasher);
-        if (fp != stdin) {
-          fclose(fp);
-        }
-        exit_code = 1;
-        break;
-      }
-      size_t n;
-      while ((n = fread(buf, 1, buf_sz, fp)) > 0) {
-        blake3plus_hasher_update_mt(&hasher, buf, n, threads);
-      }
-      if (ferror(fp)) {
-        fprintf(stderr, "b3p: %s: read error\n", path);
-        blake3plus_hasher_secure_wipe(&hasher);
-        blake3plus_secure_zero(buf, buf_sz);
-        free(buf);
-        if (fp != stdin) {
-          fclose(fp);
+        if (fd != 0) {
+          close(fd);
         }
         exit_code = 1;
         continue;
       }
       blake3_hasher_finalize(&hasher, out, out_len);
       blake3plus_hasher_secure_wipe(&hasher);
-      blake3plus_secure_zero(buf, buf_sz);
-      free(buf);
-      if (fp != stdin) {
-        fclose(fp);
+      if (fd != 0) {
+        close(fd);
       }
     }
 

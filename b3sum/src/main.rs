@@ -177,7 +177,7 @@ fn hash_path(args: &Args, path: &Path) -> anyhow::Result<blake3::OutputReader> {
         if args.keyed() {
             bail!("Cannot open `-` in keyed mode");
         }
-        blake3::blake3plus::update_hasher_reader_mt(&mut hasher, io::stdin().lock())?;
+        blake3::blake3plus::update_hasher_reader_mt(&mut hasher, io::stdin())?;
     } else if args.no_mmap() {
         blake3::blake3plus::update_hasher_reader_mt(&mut hasher, File::open(path)?)?;
     } else {

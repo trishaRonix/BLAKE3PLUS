@@ -7,6 +7,8 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 /* Internal hook implemented in blake3.c */
 extern void blake3_hasher_update_mt_internal(blake3_hasher *self,
                                              const void *input,
@@ -22,7 +28,17 @@ extern void blake3_hasher_update_mt_internal(blake3_hasher *self,
 
 #define B3P_MAX_WORKERS 64
 #define B3P_MAX_SPIN_ITERS 256
+#define B3P_TASK_RING_CAP 256
 #define B3P_MAX_MMAP_BYTES (1ULL << 30)
+#define B3P_STREAM_BUF_SIZE (4 * 1024 * 1024)
+
+typedef enum {
+  B3P_TASK_FREE = 0,
+  B3P_TASK_ALLOCATED = 1,
+  B3P_TASK_QUEUED = 2,
+  B3P_TASK_RUNNING = 3,
+  B3P_TASK_DONE = 4
+} b3p_slot_state_t;
 
 typedef struct {
   const uint32_t *key;
@@ -32,28 +48,44 @@ typedef struct {
   uint64_t chunk_counter;
   uint8_t *cvs;
   size_t out_n;
-  size_t budget;
-} subtree_task_t;
-
-typedef struct __attribute__((aligned(128))) {
-  pthread_t thread;
+  atomic_int state;
   pthread_mutex_t mtx;
   pthread_cond_t cv;
-  pthread_mutex_t done_mtx;
-  pthread_cond_t done_cv;
-  atomic_int done;
-  subtree_task_t *task;
-  bool shutdown;
-  atomic_bool busy;
-} b3p_worker_t;
+} b3p_task_slot_t;
 
-static b3p_worker_t g_workers[B3P_MAX_WORKERS];
+static b3p_task_slot_t g_slots[B3P_TASK_RING_CAP];
+static pthread_once_t g_slots_once = PTHREAD_ONCE_INIT;
+
+static void b3p_init_slots(void) {
+  for (size_t i = 0; i < B3P_TASK_RING_CAP; i++) {
+    atomic_init(&g_slots[i].state, B3P_TASK_FREE);
+    pthread_mutex_init(&g_slots[i].mtx, NULL);
+    pthread_cond_init(&g_slots[i].cv, NULL);
+  }
+}
+
+typedef struct {
+  size_t queue[B3P_TASK_RING_CAP];
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t cv;
+  bool shutdown;
+} b3p_ring_queue_t;
+
+static b3p_ring_queue_t g_ring = {
+  .head = 0, .tail = 0, .count = 0,
+  .lock = PTHREAD_MUTEX_INITIALIZER,
+  .cv = PTHREAD_COND_INITIALIZER,
+  .shutdown = false
+};
+
+static pthread_t g_worker_threads[B3P_MAX_WORKERS];
 static atomic_size_t g_num_workers = 0;
 static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
 static atomic_bool g_pool_fork_active = false;
-
-static _Thread_local size_t tl_thread_budget = 1;
 
 #if defined(__linux__)
 static size_t b3p_parse_cgroup_v2_cpu_max(const char *path) {
@@ -158,6 +190,10 @@ BLAKE3_API size_t blake3plus_get_effective_cpus(void) {
       affinity_cpus = (size_t)count;
     }
   }
+#elif defined(_WIN32)
+  SYSTEM_INFO sysinfo;
+  GetSystemInfo(&sysinfo);
+  affinity_cpus = (size_t)sysinfo.dwNumberOfProcessors;
 #endif
   if (affinity_cpus == 0) {
     long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
@@ -179,30 +215,82 @@ BLAKE3_API size_t blake3plus_get_active_workers(void) {
   return atomic_load_explicit(&g_num_workers, memory_order_acquire);
 }
 
-static void *b3p_worker_loop(void *arg) {
-  b3p_worker_t *w = (b3p_worker_t *)arg;
-  while (1) {
-    pthread_mutex_lock(&w->mtx);
-    while (w->task == NULL && !w->shutdown) {
-      pthread_cond_wait(&w->cv, &w->mtx);
+static size_t b3p_acquire_free_slot(void) {
+  static _Thread_local size_t tl_start = 0;
+  size_t start = tl_start;
+  for (size_t i = 0; i < B3P_TASK_RING_CAP; i++) {
+    size_t idx = (start + i) % B3P_TASK_RING_CAP;
+    int exp = B3P_TASK_FREE;
+    if (atomic_compare_exchange_strong_explicit(&g_slots[idx].state, &exp, B3P_TASK_ALLOCATED,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+      tl_start = (idx + 1) % B3P_TASK_RING_CAP;
+      return idx;
     }
-    if (w->shutdown && w->task == NULL) {
-      pthread_mutex_unlock(&w->mtx);
+  }
+  return SIZE_MAX;
+}
+
+static bool b3p_ring_push(size_t slot_idx) {
+  pthread_mutex_lock(&g_ring.lock);
+  if (g_ring.count == B3P_TASK_RING_CAP) {
+    pthread_mutex_unlock(&g_ring.lock);
+    return false;
+  }
+  g_ring.queue[g_ring.tail] = slot_idx;
+  g_ring.tail = (g_ring.tail + 1) % B3P_TASK_RING_CAP;
+  g_ring.count++;
+  pthread_cond_signal(&g_ring.cv);
+  pthread_mutex_unlock(&g_ring.lock);
+  return true;
+}
+
+static size_t b3p_ring_try_pop(void) {
+  pthread_mutex_lock(&g_ring.lock);
+  if (g_ring.count == 0) {
+    pthread_mutex_unlock(&g_ring.lock);
+    return SIZE_MAX;
+  }
+  size_t slot = g_ring.queue[g_ring.head];
+  g_ring.head = (g_ring.head + 1) % B3P_TASK_RING_CAP;
+  g_ring.count--;
+  pthread_mutex_unlock(&g_ring.lock);
+  return slot;
+}
+
+static void b3p_execute_slot(size_t slot_idx) {
+  b3p_task_slot_t *slot = &g_slots[slot_idx];
+  int exp = B3P_TASK_QUEUED;
+  if (!atomic_compare_exchange_strong_explicit(&slot->state, &exp, B3P_TASK_RUNNING,
+                                              memory_order_acq_rel, memory_order_acquire)) {
+    return;
+  }
+  slot->out_n = blake3_compress_subtree_wide(
+      slot->input, slot->input_len, slot->key, slot->chunk_counter,
+      slot->flags, slot->cvs, true);
+
+  pthread_mutex_lock(&slot->mtx);
+  atomic_store_explicit(&slot->state, B3P_TASK_DONE, memory_order_release);
+  pthread_cond_broadcast(&slot->cv);
+  pthread_mutex_unlock(&slot->mtx);
+}
+
+static void *b3p_worker_loop(void *arg) {
+  (void)arg;
+  while (1) {
+    pthread_mutex_lock(&g_ring.lock);
+    while (g_ring.count == 0 && !g_ring.shutdown) {
+      pthread_cond_wait(&g_ring.cv, &g_ring.lock);
+    }
+    if (g_ring.shutdown && g_ring.count == 0) {
+      pthread_mutex_unlock(&g_ring.lock);
       break;
     }
-    subtree_task_t *t = w->task;
-    w->task = NULL;
-    pthread_mutex_unlock(&w->mtx);
+    size_t slot_idx = g_ring.queue[g_ring.head];
+    g_ring.head = (g_ring.head + 1) % B3P_TASK_RING_CAP;
+    g_ring.count--;
+    pthread_mutex_unlock(&g_ring.lock);
 
-    tl_thread_budget = t->budget;
-    t->out_n = blake3_compress_subtree_wide(
-        t->input, t->input_len, t->key, t->chunk_counter,
-        t->flags, t->cvs, t->budget > 1);
-
-    pthread_mutex_lock(&w->done_mtx);
-    atomic_store_explicit(&w->done, 1, memory_order_release);
-    pthread_cond_signal(&w->done_cv);
-    pthread_mutex_unlock(&w->done_mtx);
+    b3p_execute_slot(slot_idx);
   }
   return NULL;
 }
@@ -210,23 +298,11 @@ static void *b3p_worker_loop(void *arg) {
 static void b3p_atfork_prepare(void) {
   atomic_store_explicit(&g_pool_fork_active, true, memory_order_release);
   pthread_mutex_lock(&g_pool_lock);
-
-  size_t active = atomic_load_explicit(&g_num_workers, memory_order_acquire);
-  for (size_t i = 0; i < active; i++) {
-    while (atomic_load_explicit(&g_workers[i].busy, memory_order_acquire)) {
-      sched_yield();
-    }
-  }
-  for (size_t i = 0; i < active; i++) {
-    pthread_mutex_lock(&g_workers[i].mtx);
-  }
+  pthread_mutex_lock(&g_ring.lock);
 }
 
 static void b3p_atfork_parent(void) {
-  size_t active = atomic_load_explicit(&g_num_workers, memory_order_acquire);
-  for (size_t i = active; i > 0; i--) {
-    pthread_mutex_unlock(&g_workers[i - 1].mtx);
-  }
+  pthread_mutex_unlock(&g_ring.lock);
   pthread_mutex_unlock(&g_pool_lock);
   atomic_store_explicit(&g_pool_fork_active, false, memory_order_release);
 }
@@ -235,17 +311,16 @@ static void b3p_atfork_child(void) {
   atomic_store_explicit(&g_pool_fork_active, false, memory_order_release);
   atomic_store_explicit(&g_num_workers, 0, memory_order_relaxed);
   pthread_mutex_init(&g_pool_lock, NULL);
-
-  for (size_t i = 0; i < B3P_MAX_WORKERS; i++) {
-    pthread_mutex_init(&g_workers[i].mtx, NULL);
-    pthread_cond_init(&g_workers[i].cv, NULL);
-    pthread_mutex_init(&g_workers[i].done_mtx, NULL);
-    pthread_cond_init(&g_workers[i].done_cv, NULL);
-    atomic_init(&g_workers[i].busy, false);
-    atomic_init(&g_workers[i].done, 0);
-    g_workers[i].task = NULL;
-    g_workers[i].shutdown = false;
-    memset(&g_workers[i].thread, 0, sizeof(pthread_t));
+  pthread_mutex_init(&g_ring.lock, NULL);
+  pthread_cond_init(&g_ring.cv, NULL);
+  g_ring.head = 0;
+  g_ring.tail = 0;
+  g_ring.count = 0;
+  g_ring.shutdown = false;
+  for (size_t i = 0; i < B3P_TASK_RING_CAP; i++) {
+    atomic_init(&g_slots[i].state, B3P_TASK_FREE);
+    pthread_mutex_init(&g_slots[i].mtx, NULL);
+    pthread_cond_init(&g_slots[i].cv, NULL);
   }
 }
 
@@ -264,28 +339,27 @@ BLAKE3_API void blake3plus_pool_teardown(void) {
 
   atomic_store_explicit(&g_num_workers, 0, memory_order_release);
 
-  for (size_t i = 0; i < current; i++) {
-    while (atomic_load_explicit(&g_workers[i].busy, memory_order_acquire)) {
-      sched_yield();
-    }
-  }
+  pthread_mutex_lock(&g_ring.lock);
+  g_ring.shutdown = true;
+  pthread_cond_broadcast(&g_ring.cv);
+  pthread_mutex_unlock(&g_ring.lock);
 
   for (size_t i = 0; i < current; i++) {
-    pthread_mutex_lock(&g_workers[i].mtx);
-    g_workers[i].shutdown = true;
-    pthread_cond_signal(&g_workers[i].cv);
-    pthread_mutex_unlock(&g_workers[i].mtx);
-    pthread_join(g_workers[i].thread, NULL);
-    pthread_mutex_destroy(&g_workers[i].mtx);
-    pthread_cond_destroy(&g_workers[i].cv);
-    pthread_mutex_destroy(&g_workers[i].done_mtx);
-    pthread_cond_destroy(&g_workers[i].done_cv);
-    atomic_store_explicit(&g_workers[i].busy, false, memory_order_relaxed);
+    pthread_join(g_worker_threads[i], NULL);
   }
+
+  pthread_mutex_lock(&g_ring.lock);
+  g_ring.head = 0;
+  g_ring.tail = 0;
+  g_ring.count = 0;
+  g_ring.shutdown = false;
+  pthread_mutex_unlock(&g_ring.lock);
+
   pthread_mutex_unlock(&g_pool_lock);
 }
 
 static void b3p_ensure_pool_scaled(size_t desired_threads) {
+  pthread_once(&g_slots_once, b3p_init_slots);
   pthread_once(&g_atfork_once, b3p_register_atfork);
 
   size_t hw = blake3plus_get_effective_cpus();
@@ -311,20 +385,7 @@ static void b3p_ensure_pool_scaled(size_t desired_threads) {
   (void)pthread_attr_setstacksize(&attr, BLAKE3PLUS_WORKER_STACK_SIZE);
 
   for (size_t i = current; i < target_workers; i++) {
-    pthread_mutex_init(&g_workers[i].mtx, NULL);
-    pthread_cond_init(&g_workers[i].cv, NULL);
-    pthread_mutex_init(&g_workers[i].done_mtx, NULL);
-    pthread_cond_init(&g_workers[i].done_cv, NULL);
-    atomic_init(&g_workers[i].done, 0);
-    g_workers[i].task = NULL;
-    g_workers[i].shutdown = false;
-    atomic_init(&g_workers[i].busy, false);
-    if (pthread_create(&g_workers[i].thread, &attr, b3p_worker_loop,
-                       &g_workers[i]) != 0) {
-      pthread_mutex_destroy(&g_workers[i].mtx);
-      pthread_cond_destroy(&g_workers[i].cv);
-      pthread_mutex_destroy(&g_workers[i].done_mtx);
-      pthread_cond_destroy(&g_workers[i].done_cv);
+    if (pthread_create(&g_worker_threads[i], &attr, b3p_worker_loop, NULL) != 0) {
       target_workers = i;
       break;
     }
@@ -335,33 +396,17 @@ static void b3p_ensure_pool_scaled(size_t desired_threads) {
   pthread_mutex_unlock(&g_pool_lock);
 }
 
-static b3p_worker_t *b3p_acquire_worker(void) {
-  if (atomic_load_explicit(&g_pool_fork_active, memory_order_acquire)) {
-    return NULL;
-  }
-  size_t count = atomic_load_explicit(&g_num_workers, memory_order_acquire);
-  for (size_t i = 0; i < count; i++) {
-    bool expected = false;
-    if (atomic_compare_exchange_strong_explicit(
-            &g_workers[i].busy, &expected, true,
-            memory_order_acquire, memory_order_relaxed)) {
-      return &g_workers[i];
-    }
-  }
-  return NULL;
-}
-
 BLAKE3_PRIVATE void blake3plus_compress_subtree_wide_join_pthread(
     const uint32_t key[8], uint8_t flags, bool use_mt,
     const uint8_t *l_input, size_t l_input_len, uint64_t l_chunk_counter,
     uint8_t *l_cvs, size_t *l_n,
     const uint8_t *r_input, size_t r_input_len, uint64_t r_chunk_counter,
     uint8_t *r_cvs, size_t *r_n) {
-  size_t current_budget = tl_thread_budget;
-
-  if (!use_mt || current_budget < 2 ||
+  if (!use_mt ||
       r_input_len < BLAKE3PLUS_MIN_PARALLEL_SUBTREE_BYTES ||
-      l_input_len < BLAKE3PLUS_MIN_PARALLEL_SUBTREE_BYTES) {
+      l_input_len < BLAKE3PLUS_MIN_PARALLEL_SUBTREE_BYTES ||
+      atomic_load_explicit(&g_num_workers, memory_order_acquire) == 0 ||
+      atomic_load_explicit(&g_pool_fork_active, memory_order_acquire)) {
     *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key,
                                         l_chunk_counter, flags, l_cvs, use_mt);
     *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key,
@@ -369,17 +414,8 @@ BLAKE3_PRIVATE void blake3plus_compress_subtree_wide_join_pthread(
     return;
   }
 
-  size_t total_len = l_input_len + r_input_len;
-  size_t right_budget = (current_budget * r_input_len + (total_len / 2)) / total_len;
-  if (right_budget < 1) {
-    right_budget = 1;
-  } else if (right_budget >= current_budget) {
-    right_budget = current_budget - 1;
-  }
-  size_t left_budget = current_budget - right_budget;
-
-  b3p_worker_t *worker = b3p_acquire_worker();
-  if (!worker) {
+  size_t slot_idx = b3p_acquire_free_slot();
+  if (slot_idx == SIZE_MAX) {
     *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key,
                                         l_chunk_counter, flags, l_cvs, false);
     *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key,
@@ -387,48 +423,65 @@ BLAKE3_PRIVATE void blake3plus_compress_subtree_wide_join_pthread(
     return;
   }
 
-  subtree_task_t right_task = {
-      .key = key,
-      .flags = flags,
-      .input = r_input,
-      .input_len = r_input_len,
-      .chunk_counter = r_chunk_counter,
-      .cvs = r_cvs,
-      .out_n = 0,
-      .budget = right_budget,
-  };
+  b3p_task_slot_t *slot = &g_slots[slot_idx];
+  slot->key = key;
+  slot->flags = flags;
+  slot->input = r_input;
+  slot->input_len = r_input_len;
+  slot->chunk_counter = r_chunk_counter;
+  slot->cvs = r_cvs;
+  slot->out_n = 0;
+  atomic_store_explicit(&slot->state, B3P_TASK_QUEUED, memory_order_release);
 
-  atomic_store_explicit(&worker->done, 0, memory_order_relaxed);
-  pthread_mutex_lock(&worker->mtx);
-  worker->task = &right_task;
-  pthread_cond_signal(&worker->cv);
-  pthread_mutex_unlock(&worker->mtx);
+  bool pushed = b3p_ring_push(slot_idx);
+  if (!pushed) {
+    atomic_store_explicit(&slot->state, B3P_TASK_FREE, memory_order_release);
+    *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key,
+                                        l_chunk_counter, flags, l_cvs, false);
+    *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key,
+                                        r_chunk_counter, flags, r_cvs, false);
+    return;
+  }
 
-  /* Execute Left subtree on current thread */
-  tl_thread_budget = left_budget;
+  /* Execute left subtree on current thread */
   *l_n = blake3_compress_subtree_wide(l_input, l_input_len, key,
-                                      l_chunk_counter, flags, l_cvs,
-                                      left_budget > 1);
+                                      l_chunk_counter, flags, l_cvs, true);
 
-  int spins = 0;
-  while (atomic_load_explicit(&worker->done, memory_order_acquire) == 0 &&
-         spins < B3P_MAX_SPIN_ITERS) {
+  /* Now handle right subtree */
+  int exp = B3P_TASK_QUEUED;
+  if (atomic_compare_exchange_strong_explicit(&slot->state, &exp, B3P_TASK_RUNNING,
+                                              memory_order_acq_rel, memory_order_acquire)) {
+    /* Worker hasn't picked it up yet! Caller computes it directly */
+    *r_n = blake3_compress_subtree_wide(r_input, r_input_len, key,
+                                        r_chunk_counter, flags, r_cvs, true);
+    atomic_store_explicit(&slot->state, B3P_TASK_FREE, memory_order_release);
+  } else {
+    /* A worker claimed or is running it. Help other tasks or wait */
+    while (atomic_load_explicit(&slot->state, memory_order_acquire) != B3P_TASK_DONE) {
+      size_t other = b3p_ring_try_pop();
+      if (other != SIZE_MAX) {
+        b3p_execute_slot(other);
+      } else {
+        int spins = 0;
+        while (atomic_load_explicit(&slot->state, memory_order_acquire) != B3P_TASK_DONE &&
+               spins < B3P_MAX_SPIN_ITERS) {
 #if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
+          __builtin_ia32_pause();
 #endif
-    spins++;
-  }
-  if (atomic_load_explicit(&worker->done, memory_order_acquire) == 0) {
-    pthread_mutex_lock(&worker->done_mtx);
-    while (atomic_load_explicit(&worker->done, memory_order_acquire) == 0) {
-      pthread_cond_wait(&worker->done_cv, &worker->done_mtx);
+          spins++;
+        }
+        if (atomic_load_explicit(&slot->state, memory_order_acquire) != B3P_TASK_DONE) {
+          pthread_mutex_lock(&slot->mtx);
+          while (atomic_load_explicit(&slot->state, memory_order_acquire) != B3P_TASK_DONE) {
+            pthread_cond_wait(&slot->cv, &slot->mtx);
+          }
+          pthread_mutex_unlock(&slot->mtx);
+        }
+      }
     }
-    pthread_mutex_unlock(&worker->done_mtx);
+    *r_n = slot->out_n;
+    atomic_store_explicit(&slot->state, B3P_TASK_FREE, memory_order_release);
   }
-
-  *r_n = right_task.out_n;
-  tl_thread_budget = current_budget;
-  atomic_store_explicit(&worker->busy, false, memory_order_release);
 }
 
 BLAKE3_API void blake3plus_hasher_update_mt(blake3_hasher *self,
@@ -445,9 +498,7 @@ BLAKE3_API void blake3plus_hasher_update_mt(blake3_hasher *self,
     return;
   }
   b3p_ensure_pool_scaled(threads);
-  tl_thread_budget = threads;
   blake3_hasher_update_mt_internal(self, input, input_len);
-  tl_thread_budget = 1;
 }
 
 BLAKE3_API void blake3plus_hash_buffer_mt(const void *input,
@@ -460,6 +511,101 @@ BLAKE3_API void blake3plus_hash_buffer_mt(const void *input,
   blake3plus_hasher_update_mt(&hasher, input, input_len, num_threads);
   blake3_hasher_finalize(&hasher, out, out_len);
   blake3plus_hasher_secure_wipe(&hasher);
+}
+
+/* SIGBUS handler to protect against concurrent file truncation during mmap */
+static atomic_bool g_sigbus_active = false;
+static _Thread_local sigjmp_buf tl_sigbus_env;
+static _Thread_local volatile sig_atomic_t tl_sigbus_enabled = 0;
+static struct sigaction b3p_old_sigbus_sa;
+static pthread_once_t b3p_sigbus_once = PTHREAD_ONCE_INIT;
+
+static void b3p_sigbus_handler(int sig, siginfo_t *info, void *ctx) {
+  (void)sig; (void)info; (void)ctx;
+  if (atomic_load_explicit(&g_sigbus_active, memory_order_acquire)) {
+    if (tl_sigbus_enabled) {
+      siglongjmp(tl_sigbus_env, 1);
+    }
+    pthread_exit(NULL);
+  }
+  if (b3p_old_sigbus_sa.sa_handler != SIG_DFL &&
+      b3p_old_sigbus_sa.sa_handler != SIG_IGN &&
+      b3p_old_sigbus_sa.sa_sigaction != NULL) {
+    if (b3p_old_sigbus_sa.sa_flags & SA_SIGINFO) {
+      b3p_old_sigbus_sa.sa_sigaction(sig, info, ctx);
+    } else {
+      b3p_old_sigbus_sa.sa_handler(sig);
+    }
+  } else {
+    signal(SIGBUS, SIG_DFL);
+    raise(SIGBUS);
+  }
+}
+
+static void b3p_init_sigbus(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = b3p_sigbus_handler;
+  sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGBUS, &sa, &b3p_old_sigbus_sa);
+}
+
+/* Double-buffered streaming reader context */
+typedef struct {
+  int fd;
+  uint8_t *buf[2];
+  size_t buf_sz;
+  ssize_t bytes_read[2];
+  int err[2];
+  atomic_int ready[2];
+  atomic_bool stop;
+  pthread_t thread;
+} b3p_stream_pipe_t;
+
+static void *b3p_stream_reader_worker(void *arg) {
+  b3p_stream_pipe_t *pipe = (b3p_stream_pipe_t *)arg;
+  size_t cur = 0;
+  while (!atomic_load_explicit(&pipe->stop, memory_order_acquire)) {
+    while (atomic_load_explicit(&pipe->ready[cur], memory_order_acquire) == 1 &&
+           !atomic_load_explicit(&pipe->stop, memory_order_acquire)) {
+      sched_yield();
+    }
+    if (atomic_load_explicit(&pipe->stop, memory_order_acquire)) {
+      break;
+    }
+    ssize_t n = 0;
+    while (1) {
+      n = read(pipe->fd, pipe->buf[cur], pipe->buf_sz);
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    pipe->bytes_read[cur] = n;
+    pipe->err[cur] = (n < 0) ? errno : 0;
+    atomic_store_explicit(&pipe->ready[cur], 1, memory_order_release);
+    if (n <= 0) {
+      break;
+    }
+    cur = 1 - cur;
+  }
+  return NULL;
+}
+
+static int __attribute__((noinline)) b3p_safe_mmap_update(
+    blake3_hasher *hasher, void *mapped, size_t map_len, size_t num_threads) {
+  atomic_store_explicit(&g_sigbus_active, true, memory_order_release);
+  tl_sigbus_enabled = 1;
+  if (sigsetjmp(tl_sigbus_env, 1) != 0) {
+    tl_sigbus_enabled = 0;
+    atomic_store_explicit(&g_sigbus_active, false, memory_order_release);
+    return -1;
+  }
+  blake3plus_hasher_update_mt(hasher, mapped, map_len, num_threads);
+  tl_sigbus_enabled = 0;
+  atomic_store_explicit(&g_sigbus_active, false, memory_order_release);
+  return 0;
 }
 
 static int b3p_hash_fd_internal(int fd,
@@ -475,9 +621,11 @@ static int b3p_hash_fd_internal(int fd,
   }
 
   if (S_ISREG(st.st_mode) && st.st_size > 0) {
+    pthread_once(&b3p_sigbus_once, b3p_init_sigbus);
     uint64_t remaining = (uint64_t)st.st_size;
     off_t offset = 0;
     bool mmap_ok = true;
+
     while (remaining > 0) {
       size_t map_len = (remaining > B3P_MAX_MMAP_BYTES)
                            ? (size_t)B3P_MAX_MMAP_BYTES
@@ -491,7 +639,13 @@ static int b3p_hash_fd_internal(int fd,
         return -1;
       }
       (void)madvise(mapped, map_len, MADV_SEQUENTIAL | MADV_WILLNEED);
-      blake3plus_hasher_update_mt(hasher, mapped, map_len, num_threads);
+
+      if (b3p_safe_mmap_update(hasher, mapped, map_len, num_threads) != 0) {
+        munmap(mapped, map_len);
+        mmap_ok = false;
+        break;
+      }
+
       munmap(mapped, map_len);
       offset += (off_t)map_len;
       remaining -= map_len;
@@ -502,34 +656,65 @@ static int b3p_hash_fd_internal(int fd,
     (void)lseek(fd, 0, SEEK_SET);
   }
 
-  const size_t buf_size = 4 * 1024 * 1024;
-  uint8_t *buf = (uint8_t *)malloc(buf_size);
-  if (!buf) {
+  /* Pipelined double-buffering for pipes, sockets, and non-mmap regular files */
+  b3p_stream_pipe_t pipe;
+  pipe.fd = fd;
+  pipe.buf_sz = B3P_STREAM_BUF_SIZE;
+  pipe.buf[0] = (uint8_t *)malloc(pipe.buf_sz);
+  pipe.buf[1] = (uint8_t *)malloc(pipe.buf_sz);
+  if (!pipe.buf[0] || !pipe.buf[1]) {
+    free(pipe.buf[0]);
+    free(pipe.buf[1]);
     errno = ENOMEM;
     return -1;
   }
+  atomic_init(&pipe.ready[0], 0);
+  atomic_init(&pipe.ready[1], 0);
+  atomic_init(&pipe.stop, false);
 
-  while (1) {
-    ssize_t n = read(fd, buf, buf_size);
-    if (n > 0) {
-      blake3plus_hasher_update_mt(hasher, buf, (size_t)n, num_threads);
-    } else if (n == 0) {
-      break;
-    } else {
-      if (errno == EINTR) {
-        continue;
-      }
-      int saved_errno = errno;
-      blake3plus_secure_zero(buf, buf_size);
-      free(buf);
-      errno = saved_errno;
-      return -1;
-    }
+  if (pthread_create(&pipe.thread, NULL, b3p_stream_reader_worker, &pipe) != 0) {
+    free(pipe.buf[0]);
+    free(pipe.buf[1]);
+    errno = EAGAIN;
+    return -1;
   }
 
-  blake3plus_secure_zero(buf, buf_size);
-  free(buf);
-  return 0;
+  size_t cur = 0;
+  int stream_rc = 0;
+  while (1) {
+    while (atomic_load_explicit(&pipe.ready[cur], memory_order_acquire) == 0) {
+      sched_yield();
+    }
+    if (pipe.bytes_read[cur] < 0) {
+      errno = pipe.err[cur];
+      stream_rc = -1;
+      break;
+    }
+    if (pipe.bytes_read[cur] == 0) {
+      break;
+    }
+    blake3plus_hasher_update_mt(hasher, pipe.buf[cur], (size_t)pipe.bytes_read[cur], num_threads);
+    atomic_store_explicit(&pipe.ready[cur], 0, memory_order_release);
+    cur = 1 - cur;
+  }
+
+  atomic_store_explicit(&pipe.stop, true, memory_order_release);
+  pthread_join(pipe.thread, NULL);
+  blake3plus_secure_zero(pipe.buf[0], pipe.buf_sz);
+  blake3plus_secure_zero(pipe.buf[1], pipe.buf_sz);
+  free(pipe.buf[0]);
+  free(pipe.buf[1]);
+  return stream_rc;
+}
+
+BLAKE3_API int blake3plus_hasher_hash_fd(blake3_hasher *hasher,
+                                         int fd,
+                                         size_t num_threads) {
+  if (!hasher || fd < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  return b3p_hash_fd_internal(fd, hasher, num_threads);
 }
 
 BLAKE3_API int blake3plus_hash_fd(int fd,

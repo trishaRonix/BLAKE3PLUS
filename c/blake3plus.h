@@ -42,6 +42,10 @@ BLAKE3_API int blake3plus_hash_fd(int fd,
                                   size_t out_len,
                                   size_t num_threads);
 
+BLAKE3_API int blake3plus_hasher_hash_fd(blake3_hasher *hasher,
+                                         int fd,
+                                         size_t num_threads);
+
 BLAKE3_API void blake3plus_secure_zero(void *ptr, size_t len);
 BLAKE3_API void blake3plus_hasher_secure_wipe(blake3_hasher *self);
 BLAKE3_API int blake3plus_constant_time_eq(const uint8_t *a,

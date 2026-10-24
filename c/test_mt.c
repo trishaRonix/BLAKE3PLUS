@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,6 +359,92 @@ static void test_file_mmap_and_fifo_fallback(void) {
   free(buf);
 }
 
+typedef struct {
+  const uint8_t *input;
+  size_t len;
+  const uint8_t *expected;
+  int success;
+} caller_arg_t;
+
+static void *caller_thread(void *arg) {
+  caller_arg_t *ca = (caller_arg_t *)arg;
+  uint8_t out[BLAKE3_OUT_LEN];
+  for (int iter = 0; iter < 4; iter++) {
+    blake3plus_hash_buffer_mt(ca->input, ca->len, out, sizeof(out), 0);
+    if (memcmp(out, ca->expected, BLAKE3_OUT_LEN) != 0) {
+      ca->success = 0;
+      return NULL;
+    }
+  }
+  ca->success = 1;
+  return NULL;
+}
+
+static void test_concurrent_multitenant_callers(void) {
+  size_t len = 512 * 1024 + 17;
+  uint8_t *buf = (uint8_t *)malloc(len);
+  assert(buf != NULL);
+  fill_pattern(buf, len);
+
+  uint8_t expected[BLAKE3_OUT_LEN];
+  blake3_hasher h;
+  blake3_hasher_init(&h);
+  blake3_hasher_update(&h, buf, len);
+  blake3_hasher_finalize(&h, expected, sizeof(expected));
+
+  #define NUM_CALLERS 8
+  pthread_t threads[NUM_CALLERS];
+  caller_arg_t args[NUM_CALLERS];
+  for (int i = 0; i < NUM_CALLERS; i++) {
+    args[i].input = buf;
+    args[i].len = len;
+    args[i].expected = expected;
+    args[i].success = 0;
+    assert(pthread_create(&threads[i], NULL, caller_thread, &args[i]) == 0);
+  }
+  for (int i = 0; i < NUM_CALLERS; i++) {
+    pthread_join(threads[i], NULL);
+    assert(args[i].success == 1);
+  }
+  free(buf);
+}
+
+static void test_mmap_sigbus_recovery(void) {
+  char tmp_file[128];
+  snprintf(tmp_file, sizeof(tmp_file), "/tmp/b3p_trunc_%d.bin", (int)getpid());
+  int fd = open(tmp_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  assert(fd >= 0);
+
+  size_t len = 16 * 1024 * 1024;
+  uint8_t *buf = (uint8_t *)malloc(len);
+  assert(buf != NULL);
+  fill_pattern(buf, len);
+  assert(write(fd, buf, len) == (ssize_t)len);
+  free(buf);
+  close(fd);
+
+  pid_t child = fork();
+  assert(child >= 0);
+  if (child == 0) {
+    usleep(2000);
+    int trunc_fd = open(tmp_file, O_RDWR);
+    if (trunc_fd >= 0) {
+      if (ftruncate(trunc_fd, 0) != 0) {
+        _exit(1);
+      }
+      close(trunc_fd);
+    }
+    _exit(0);
+  }
+
+  uint8_t out[BLAKE3_OUT_LEN];
+  (void)blake3plus_hash_file_mmap(tmp_file, out, sizeof(out), 0);
+
+  int st = 0;
+  waitpid(child, &st, 0);
+  unlink(tmp_file);
+}
+
 static double now_sec(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -409,6 +496,8 @@ int main(int argc, char **argv) {
   test_pool_lifecycle_and_fork();
   test_cgroup_quotas();
   test_file_mmap_and_fifo_fallback();
+  test_concurrent_multitenant_callers();
+  test_mmap_sigbus_recovery();
   printf("c/test_mt: ok\n");
   return 0;
 }
