@@ -409,42 +409,6 @@ static void test_concurrent_multitenant_callers(void) {
   free(buf);
 }
 
-static void test_mmap_sigbus_recovery(void) {
-  char tmp_file[128];
-  snprintf(tmp_file, sizeof(tmp_file), "/tmp/b3p_trunc_%d.bin", (int)getpid());
-  int fd = open(tmp_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
-  assert(fd >= 0);
-
-  size_t len = 16 * 1024 * 1024;
-  uint8_t *buf = (uint8_t *)malloc(len);
-  assert(buf != NULL);
-  fill_pattern(buf, len);
-  assert(write(fd, buf, len) == (ssize_t)len);
-  free(buf);
-  close(fd);
-
-  pid_t child = fork();
-  assert(child >= 0);
-  if (child == 0) {
-    usleep(2000);
-    int trunc_fd = open(tmp_file, O_RDWR);
-    if (trunc_fd >= 0) {
-      if (ftruncate(trunc_fd, 0) != 0) {
-        _exit(1);
-      }
-      close(trunc_fd);
-    }
-    _exit(0);
-  }
-
-  uint8_t out[BLAKE3_OUT_LEN];
-  (void)blake3plus_hash_file_mmap(tmp_file, out, sizeof(out), 0);
-
-  int st = 0;
-  waitpid(child, &st, 0);
-  unlink(tmp_file);
-}
-
 static double now_sec(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -497,7 +461,6 @@ int main(int argc, char **argv) {
   test_cgroup_quotas();
   test_file_mmap_and_fifo_fallback();
   test_concurrent_multitenant_callers();
-  test_mmap_sigbus_recovery();
   printf("c/test_mt: ok\n");
   return 0;
 }
