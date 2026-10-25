@@ -1,4 +1,4 @@
-export PATH := $(HOME)/.cargo/bin:$(PATH)
+export PATH := $(HOME)/.cargo/bin:/home/kenzema/.cargo/bin:$(PATH)
 
 CC       ?= gcc
 CFLAGS   ?= -O3 -march=native -Wall -Wextra -Werror -pthread -DBLAKE3PLUS_ENABLE_PTHREAD
@@ -11,10 +11,13 @@ C_ASM    := c/blake3_sse2_x86-64_unix.S c/blake3_sse41_x86-64_unix.S \
 
 CARGO    ?= cargo
 
-.PHONY: all test bench clean
+.PHONY: all test bench clean amalgamate
 
 all: c/b3p
 	$(CARGO) build --release --manifest-path b3sum/Cargo.toml
+
+amalgamate:
+	python3 tools/amalgamate.py
 
 c/b3p: c/b3p_cli.c c/blake3plus.h $(C_SRC) $(C_ASM)
 	$(CC) $(CFLAGS) c/b3p_cli.c $(C_SRC) $(C_ASM) -o c/b3p

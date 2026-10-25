@@ -1,0 +1,9 @@
+[wrap-git]
+directory = blake3plus
+url = https://github.com/trishaRonix/BLAKE3PLUS.git
+revision = head
+depth = 1
+
+[provide]
+blake3plus = blake3plus_dep
+blake3 = blake3_dep

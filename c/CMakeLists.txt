@@ -19,6 +19,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(BLAKE3_USE_TBB "Enable oneTBB parallelism" OFF)
 option(BLAKE3_FETCH_TBB "Allow fetching oneTBB from GitHub if not found on system" OFF)
+option(BLAKE3PLUS_ENABLE_PTHREAD "Enable C11 pthread multithreading in BLAKE3PLUS" ON)
 
 include(CTest)
 include(FeatureSummary)
@@ -133,6 +134,15 @@ add_library(blake3
   blake3_portable.c
 )
 add_library(BLAKE3::blake3 ALIAS blake3)
+
+if(BLAKE3PLUS_ENABLE_PTHREAD)
+  find_package(Threads REQUIRED)
+  target_sources(blake3 PRIVATE blake3plus.c)
+  target_link_libraries(blake3 PUBLIC Threads::Threads)
+  target_compile_definitions(blake3 PUBLIC BLAKE3PLUS_ENABLE_PTHREAD)
+  add_library(blake3plus ALIAS blake3)
+  add_library(BLAKE3PLUS::blake3plus ALIAS blake3)
+endif()
 
 # library configuration
 set(PKG_CONFIG_CFLAGS)

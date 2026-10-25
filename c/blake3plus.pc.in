@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=@CMAKE_INSTALL_PREFIX@
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+
+Name: blake3plus
+Description: BLAKE3 cryptographic hash with C11 pthread multithreading and container safety
+Version: @BLAKE3PLUS_VERSION_STRING@
+Libs: -L${libdir} -lblake3plus -pthread
+Cflags: -I${includedir} -pthread -DBLAKE3PLUS_ENABLE_PTHREAD
